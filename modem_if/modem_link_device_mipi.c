@@ -53,17 +53,12 @@ static int mipi_hsi_init_communication(struct link_device *ld,
 		return hsi_init_handshake(mipi_ld, HSI_INIT_MODE_NORMAL);
 
 	case IPC_BOOT:
-		if (iod->id == 0x0) {
-			/* to prevent modem back powering by mipi
-			 * do not intialize mipi-link here !!
-			 */
-			mipi_ld->modem_power_on = false;
-			return 0;
-		} else if (iod->id == 0x01) {
+		if (iod->id == 0x0)
 			return hsi_init_handshake(mipi_ld,
-				HSI_INIT_MODE_FLASHLESS_BOOT_EBL);
-		} else
-			return 0;
+				HSI_INIT_MODE_FLASHLESS_BOOT);
+
+		return hsi_init_handshake(mipi_ld,
+			HSI_INIT_MODE_FLASHLESS_BOOT_EBL);
 
 	case IPC_RAMDUMP:
 		return hsi_init_handshake(mipi_ld,
@@ -116,7 +111,6 @@ static int mipi_hsi_send(struct link_device *ld, struct io_device *iod,
 
 	switch (iod->format) {
 	case IPC_RAW:
-	case IPC_MULTI_RAW:
 		txq = &ld->sk_raw_tx_q;
 		break;
 
@@ -134,16 +128,6 @@ static int mipi_hsi_send(struct link_device *ld, struct io_device *iod,
 		return ret;
 
 	case IPC_BOOT:
-		if (iod->id == 0x0 && unlikely(!mipi_ld->modem_power_on)) {
-			mipi_ld->modem_power_on = true;
-			ret = hsi_init_handshake(mipi_ld,
-				HSI_INIT_MODE_FLASHLESS_BOOT);
-			if (ret < 0) {
-				pr_err("[MIPI-HSI] init fail : %d\n", ret);
-				return ret;
-			}
-		}
-
 		ret = if_hsi_write(&mipi_ld->hsi_channles[
 					HSI_FLASHLESS_CHANNEL],
 					(u32 *)skb->data, skb->len);
@@ -163,13 +147,7 @@ static int mipi_hsi_send(struct link_device *ld, struct io_device *iod,
 		break;
 	}
 
-	/* set wake_lock to prevent to sleep before tx_work thread run */
-	if (!wake_lock_active(&mipi_ld->wlock)) {
-		wake_lock(&mipi_ld->wlock);
-		pr_debug("[MIPI-HSI] wake_lock\n");
-	}
-
-	/* store the tx size before run the tx_delayed_work*/
+	/* store the tx size before run the tx_work, tx_delayed_work*/
 	tx_size = skb->len;
 
 	/* save io device into cb area */
@@ -177,7 +155,7 @@ static int mipi_hsi_send(struct link_device *ld, struct io_device *iod,
 	/* en queue skb data */
 	skb_queue_tail(txq, skb);
 
-	if ((iod->format == IPC_RAW) || (iod->format == IPC_MULTI_RAW))
+	if (iod->format == IPC_RAW)
 		queue_delayed_work(ld->tx_raw_wq, &ld->tx_delayed_work, 0);
 	else
 		queue_work(ld->tx_wq, &ld->tx_work);
@@ -235,21 +213,8 @@ static void mipi_hsi_tx_work(struct work_struct *work)
 			if (ret < 0) {
 				/* TODO: Re Enqueue */
 				pr_err("[MIPI-HSI] write fail : %d\n", ret);
-			}  else {
+			}  else
 				pr_debug("[MIPI-HSI] write Done\n");
-
-				if ((iod->format == IPC_FMT) ||
-						(iod->format == IPC_RFS))
-					print_hex_dump(KERN_DEBUG,
-							iod->format == IPC_FMT ?
-							"IPC-TX: " : "RFS-TX: ",
-							DUMP_PREFIX_NONE,
-							1, 1,
-							(void *)fmt_skb->data,
-							fmt_skb->len <= 16 ?
-							(size_t)fmt_skb->len :
-							(size_t)16, false);
-			}
 
 			dev_kfree_skb_any(fmt_skb);
 		}
@@ -680,21 +645,15 @@ static void hsi_conn_err_recovery(struct mipi_link_device *mipi_ld)
 	struct hst_ctx tx_config;
 	struct hsr_ctx rx_config;
 	unsigned long int flags;
-	struct if_hsi_command *hsi_cmd;
+	struct if_hsi_command *hsi_cmd, *temp;
 
 	/* Remove all tx-command in list */
-	do {
-		spin_lock_irqsave(&mipi_ld->list_cmd_lock, flags);
-		if (!list_empty(&mipi_ld->list_of_hsi_cmd)) {
-			hsi_cmd = list_entry(mipi_ld->list_of_hsi_cmd.next,
-					struct if_hsi_command, list);
+	spin_lock_irqsave(&mipi_ld->list_cmd_lock, flags);
+	if (!list_empty(&mipi_ld->list_of_hsi_cmd))
+		list_for_each_entry_safe(hsi_cmd, temp,
+					&mipi_ld->list_of_hsi_cmd, list)
 			list_del(&hsi_cmd->list);
-			spin_unlock_irqrestore(&mipi_ld->list_cmd_lock, flags);
-		} else {
-			spin_unlock_irqrestore(&mipi_ld->list_cmd_lock, flags);
-			break;
-		}
-	} while (true);
+	spin_unlock_irqrestore(&mipi_ld->list_cmd_lock, flags);
 
 	if (timer_pending(&mipi_ld->hsi_acwake_down_timer))
 		del_timer(&mipi_ld->hsi_acwake_down_timer);
@@ -751,7 +710,7 @@ static void hsi_conn_err_recovery(struct mipi_link_device *mipi_ld)
 		}
 	}
 
-	pr_info("[MIPI-HSI] hsi_conn_err_recovery Done\n");
+	pr_debug("[MIPI-HSI] hsi_conn_err_recovery Done\n");
 }
 
 static void hsi_conn_reset(struct mipi_link_device *mipi_ld)
@@ -760,21 +719,15 @@ static void hsi_conn_reset(struct mipi_link_device *mipi_ld)
 	struct hst_ctx tx_config;
 	struct hsr_ctx rx_config;
 	unsigned long int flags;
-	struct if_hsi_command *hsi_cmd;
+	struct if_hsi_command *hsi_cmd, *temp;
 
 	/* Remove all tx-command in list */
-	do {
-		spin_lock_irqsave(&mipi_ld->list_cmd_lock, flags);
-		if (!list_empty(&mipi_ld->list_of_hsi_cmd)) {
-			hsi_cmd = list_entry(mipi_ld->list_of_hsi_cmd.next,
-					struct if_hsi_command, list);
+	spin_lock_irqsave(&mipi_ld->list_cmd_lock, flags);
+	if (!list_empty(&mipi_ld->list_of_hsi_cmd))
+		list_for_each_entry_safe(hsi_cmd, temp,
+					&mipi_ld->list_of_hsi_cmd, list)
 			list_del(&hsi_cmd->list);
-			spin_unlock_irqrestore(&mipi_ld->list_cmd_lock, flags);
-		} else {
-			spin_unlock_irqrestore(&mipi_ld->list_cmd_lock, flags);
-			break;
-		}
-	} while (true);
+	spin_unlock_irqrestore(&mipi_ld->list_cmd_lock, flags);
 
 	if (timer_pending(&mipi_ld->hsi_acwake_down_timer))
 		del_timer(&mipi_ld->hsi_acwake_down_timer);
@@ -978,7 +931,8 @@ static int if_hsi_decode_cmd(struct mipi_link_device *mipi_ld,
 				HSI_CONTROL_CHANNEL, 0);
 		pr_err("[MIPI-HSI] Send MSG BREAK TO CP\n");
 
-		schedule_delayed_work(&mipi_ld->start_work, HZ / 100);
+		schedule_delayed_work(&mipi_ld->start_work,
+					msecs_to_jiffies(10));
 		return -1;
 
 	case HSI_LL_MSG_OPEN_CONN:
@@ -1119,12 +1073,12 @@ static int if_hsi_rx_cmd_handle(struct mipi_link_device *mipi_ld, u32 cmd,
 			ret = if_hsi_send_command(mipi_ld, HSI_LL_MSG_ACK, ch,
 						param);
 			if (ret) {
-				pr_err("[MIPI-HSI] if_hsi_send_command fail : %d\n",
+				pr_err("[MIPI-HSI] if_hsi_send_command fail=%d\n",
 							ret);
 				return ret;
 			}
-			pr_debug("[MIPI-HSI] wrong state : %08x, recv_step : %d, "
-				"size : %d\n", cmd, channel->recv_step, param);
+			pr_debug("[MIPI-HSI] wrong state=%08x, recv_step=%d, size=%d\n",
+						cmd, channel->recv_step, param);
 
 			return -1;
 		}
@@ -1269,7 +1223,7 @@ retry_send:
 						list) {
 				if (iod->format == IPC_FMT) {
 					iod->modem_state_changed(iod,
-						STATE_CRASH_RESET);
+						STATE_CRASH_EXIT);
 					break;
 				}
 			}
@@ -1632,20 +1586,8 @@ static void if_hsi_read_done(struct hsi_device *dev, unsigned int size)
 				hsi_conn_err_recovery(mipi_ld);
 				return;
 			}
-
-			if ((iod->format == IPC_FMT) ||
-						(iod->format == IPC_RFS))
-				print_hex_dump(KERN_DEBUG,
-						iod->format == IPC_FMT ?
-						"IPC-RX: " : "RFS-RX: ",
-						DUMP_PREFIX_NONE,
-						1, 1,
-						(void *)channel->rx_data,
-						channel->packet_size <= 16 ?
-						(size_t)channel->packet_size :
-						(size_t)16, false);
-
 			channel->packet_size = 0;
+
 			ch = channel->channel_id;
 			param = 0;
 			ret = if_hsi_send_command(mipi_ld,
